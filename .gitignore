@@ -1,0 +1,25 @@
+# Token and config — never commit these
+hotstar_token.json
+hs_token.json
+hotstar_cfg.json
+.hotstar_did
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Downloads (just in case)
+*.mp4
+*.mkv
+*.ts
