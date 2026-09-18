@@ -1,0 +1,8 @@
+# Required
+requests>=2.28.0
+
+# Auto-installed on first download run (recommended for speed)
+yt-dlp>=2024.1.0
+
+# GUI is built on tkinter — comes with Python, no install needed
+# ffmpeg and N_m3u8DL-RE are external tools, see README for setup
