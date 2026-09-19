@@ -422,17 +422,6 @@ def run_download(stream_url, out_dir, out_name, quality, cfg, progress_cb, log_c
                "--header", "Referer: https://www.hotstar.com/",
                "--header", "Origin: https://www.hotstar.com"]
         # ── audio selection ──────────────────────────────────────────────────────
-        # N_m3u8DL-RE only accepts ONE --select-audio flag total.
-        #
-        # Correct multi-lang syntax (from official README):
-        #   -sa lang="hi|te|ta":for=bestN
-        #   → picks the top N tracks by bandwidth from all tracks whose lang
-        #     matches the regex.  With 3 langs each at 129/65/49 kbps, the
-        #     top 3 by bandwidth are hi@129 + te@129 + ta@129. ✓
-        #
-        # DO NOT use multiple --select-audio flags (parser error).
-        # DO NOT use --drop-audio "Bandwidth<N" (not a valid property; use bwMin/bwMax).
-        # ─────────────────────────────────────────────────────────────────────────
         if audio_lang and audio_lang not in ("best", ""):
             codes = [c.strip() for c in audio_lang.split(",") if c.strip()]
             if len(codes) == 1:
