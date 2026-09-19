@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 JioHotstar Downloader GUI  v4
-Made by Rvind
-
 pip install requests
 python hotstar_gui.py
 """
@@ -103,9 +101,11 @@ DEFAULT_CFG = {
     "token_file":    os.path.join(APP_DIR, "hotstar_token.json"),
     "output_dir":    r"E:\Downloads",
     "n_m3u8dl_path": r"E:\N_m3u8DL-RE.exe",
+    "ytdlp_path":    "yt-dlp",
     "ffmpeg_path":   "ffmpeg",
     "threads":       16,
     "grab_subs":     False,
+    "engine":        "auto",   # "auto" | "n_m3u8dl" | "ytdlp" | "ffmpeg"
 }
 
 def load_cfg():
@@ -247,11 +247,23 @@ def fmt_size(b):
     if b < 1024**3: return f"{b/1024**2:.0f} MB"
     return f"{b/1024**3:.2f} GB"
 
+LANG_NAMES = {
+    "hin":"Hindi","tam":"Tamil","tel":"Telugu","eng":"English","kan":"Kannada",
+    "mal":"Malayalam","ben":"Bengali","mar":"Marathi","pun":"Punjabi","guj":"Gujarati",
+    "urd":"Urdu","arb":"Arabic","fre":"French","spa":"Spanish","ger":"German",
+    "jpn":"Japanese","kor":"Korean","chi":"Chinese","zho":"Chinese","por":"Portuguese",
+}
+
+def lang_label(code):
+    return LANG_NAMES.get(code.lower(), code.upper())
+
 def parse_qualities(mpd_url):
     try:
         r = requests.get(mpd_url, timeout=10, headers={"Referer":"https://www.hotstar.com/"})
         txt = r.text
         dur = get_duration_secs(txt)
+
+        # ── parse video qualities ──
         all_reps = re.findall(r'<Representation\b([^>]+)>', txt)
         seen, out, video_idx = set(), [], 0
         for attrs in all_reps:
@@ -271,8 +283,36 @@ def parse_qualities(mpd_url):
                              "mpd_video_idx":video_idx,"est_size":fmt_size(est),"mbps":bw/1e6})
             video_idx += 1
         out.sort(key=lambda x: x["height"], reverse=True)
-        return out, dur
-    except: return [], None
+
+        # ── parse audio tracks — collect max bitrate per lang ──
+        audio_tracks = []
+        seen_audio   = {}   # lang -> max_kbps
+        for block in re.finditer(r'<AdaptationSet[^>]+mimeType="audio/mp4"[^>]*>(.*?)</AdaptationSet>',
+                                  txt, re.DOTALL | re.IGNORECASE):
+            lang_m = re.search(r'lang="([^"]+)"', block.group(0))
+            lang   = lang_m.group(1) if lang_m else "und"
+            # extract all Representation bandwidths inside this AdaptationSet
+            bws = [int(m)/1000 for m in re.findall(r'bandwidth="(\d+)"', block.group(1))]
+            max_kbps = max(bws) if bws else 128
+            if lang not in seen_audio or max_kbps > seen_audio[lang]:
+                seen_audio[lang] = max_kbps
+        for lang, max_kbps in seen_audio.items():
+            audio_tracks.append({"code": lang, "label": lang_label(lang), "max_kbps": max_kbps})
+
+        # ── parse subtitle tracks ──
+        sub_tracks = []
+        seen_subs = set()
+        for block in re.finditer(r'<AdaptationSet[^>]+contentType="text"[^>]*>(.*?)</AdaptationSet>',
+                                  txt, re.DOTALL | re.IGNORECASE):
+            lang_m = re.search(r'lang="([^"]+)"', block.group(0))
+            lang   = lang_m.group(1) if lang_m else "und"
+            if lang not in seen_subs:
+                seen_subs.add(lang)
+                sub_tracks.append({"code": lang, "label": lang_label(lang)})
+
+        return out, dur, audio_tracks, sub_tracks
+    except:
+        return [], None, [], []
 
 def extract_cid(s):
     s = s.strip().split('?')[0]
@@ -335,13 +375,18 @@ def run_download(stream_url, out_dir, out_name, quality, cfg, progress_cb, log_c
     Returns (True/False, out_path or None)
     """
     os.makedirs(out_dir, exist_ok=True)
-    n_path  = cfg.get("n_m3u8dl_path","")
-    ff_path = cfg.get("ffmpeg_path","ffmpeg")
-    threads = cfg.get("threads", 16)
-    subs    = cfg.get("grab_subs", False)
-    dur     = cfg.get("_duration")
-    height  = quality["height"] if quality else 0
-    out_mp4 = os.path.join(out_dir, out_name+".mp4")
+    n_path    = cfg.get("n_m3u8dl_path","")
+    ytdlp_path= cfg.get("ytdlp_path","yt-dlp")
+    ff_path   = cfg.get("ffmpeg_path","ffmpeg")
+    threads   = cfg.get("threads", 16)
+    subs      = cfg.get("grab_subs", False)
+    dur       = cfg.get("_duration")
+    height    = quality["height"] if quality else 0
+    out_mp4   = os.path.join(out_dir, out_name+".mkv")
+    engine    = cfg.get("engine", "auto")               # "auto"|"n_m3u8dl"|"ytdlp"|"ffmpeg"
+    audio_lang     = cfg.get("audio_lang", "best")      # "best" | "hi,te,ta" | "te" etc
+    sub_lang       = cfg.get("sub_lang",   "NONE")      # "NONE" | "ALL" | lang code
+    audio_max_kbps = cfg.get("_audio_max_kbps", {})     # {lang: max_kbps} from MPD parse
 
     def run_proc(cmd, parse_fn):
         """Run subprocess, stream output, respect cancel_flag."""
@@ -364,7 +409,8 @@ def run_download(stream_url, out_dir, out_name, quality, cfg, progress_cb, log_c
             return -1
 
     # ── 1. N_m3u8DL-RE (fastest — aria2c parallel) ──
-    if n_path and os.path.exists(n_path):
+    use_n = engine in ("auto", "n_m3u8dl")
+    if use_n and n_path and os.path.exists(n_path):
         res_map = {1080:"res='1920x1080'",720:"res='1280x720'",
                    480:"res='854x480'",360:"res='640x360'",240:"res='426x240'",180:"res='320x180'"}
         sel = res_map.get(height)
@@ -372,11 +418,49 @@ def run_download(stream_url, out_dir, out_name, quality, cfg, progress_cb, log_c
                "--save-name", out_name, "--save-dir", out_dir,
                "--binary-merge", "--del-after-done", "--no-date-info",
                "--thread-count", str(threads),
+               "-mt",                              # concurrent download: video+audio+subs in parallel
+               "--mux-after-done", "format=mkv",   # merge all tracks into one MKV after done
                "--header", "Referer: https://www.hotstar.com/",
                "--header", "Origin: https://www.hotstar.com"]
-        if sel: cmd += ["--select-video", sel, "--select-audio", "best"]
-        else:   cmd += ["--select-video", "best", "--select-audio", "best"]
-        if subs: cmd += ["--select-subtitle", "all"]
+        # ── audio selection ──────────────────────────────────────────────────────
+        # N_m3u8DL-RE only accepts ONE --select-audio flag total.
+        #
+        # Correct multi-lang syntax (from official README):
+        #   -sa lang="hi|te|ta":for=bestN
+        #   → picks the top N tracks by bandwidth from all tracks whose lang
+        #     matches the regex.  With 3 langs each at 129/65/49 kbps, the
+        #     top 3 by bandwidth are hi@129 + te@129 + ta@129. ✓
+        #
+        # DO NOT use multiple --select-audio flags (parser error).
+        # DO NOT use --drop-audio "Bandwidth<N" (not a valid property; use bwMin/bwMax).
+        # ─────────────────────────────────────────────────────────────────────────
+        if audio_lang and audio_lang not in ("best", ""):
+            codes = [c.strip() for c in audio_lang.split(",") if c.strip()]
+            if len(codes) == 1:
+                # single lang — just grab the best track for that language
+                cmd += ["--select-audio", f"lang={codes[0]}:for=best"]
+            else:
+                # multi-lang — pipe-join langs and pick top N by bandwidth
+                # e.g. lang=hi|te|ta:for=best3 → hi@129 + te@129 + ta@129
+                lang_re = "|".join(codes)
+                n       = len(codes)
+                cmd += ["--select-audio", f"lang={lang_re}:for=best{n}"]
+        else:
+            cmd += ["--select-audio", "best"]
+
+        if sel: cmd += ["--select-video", sel]
+        else:   cmd += ["--select-video", "best"]
+
+        # subtitle selection — single flag with regex OR for multi-sub
+        if sub_lang == "ALL" or subs:
+            cmd += ["--select-subtitle", "all"]
+        elif sub_lang and sub_lang not in ("NONE", ""):
+            codes_s = [c.strip() for c in sub_lang.split(",") if c.strip()]
+            if len(codes_s) == 1:
+                cmd += ["--select-subtitle", f"lang={codes_s[0]}"]
+            else:
+                sub_re = "|".join(codes_s)
+                cmd += ["--select-subtitle", f"lang=({sub_re})"]
         log_cb(f"[N_m3u8DL-RE] {threads} threads | {height}p\n\n")
         pct_re   = re.compile(r'(\d+(?:\.\d+)?)\s*%')
         spd_re   = re.compile(r'(\d+(?:\.\d+)?)\s*(K|M|G)B/s', re.I)
@@ -386,22 +470,36 @@ def run_download(stream_url, out_dir, out_name, quality, cfg, progress_cb, log_c
         rc = run_proc(cmd, parse_n)
         if rc == 0:   progress_cb(100,""); return True, out_mp4
         if rc == -99: return False, None
+        # N_m3u8DL-RE failed — if user explicitly chose it, stop here with clear error
+        if engine == "n_m3u8dl":
+            log_cb("[✗] N_m3u8DL-RE failed. Check the log above.\n")
+            return False, None
+        log_cb("[!] N_m3u8DL-RE failed, trying yt-dlp...\n\n")
 
     # ── 2. yt-dlp (concurrent fragments — much faster than ffmpeg) ──
-    ytdlp = find_exe(["yt-dlp", r"E:\yt-dlp.exe", os.path.join(APP_DIR,"yt-dlp.exe")])
-    if not ytdlp:
-        # try to install it
-        log_cb("[~] yt-dlp not found, installing via pip...\n")
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "yt-dlp", "-q"], timeout=60)
-            ytdlp = find_exe(["yt-dlp"])
-            if ytdlp: log_cb("[✓] yt-dlp installed\n\n")
-        except: pass
+    use_yt = engine in ("auto", "ytdlp")
+    ytdlp = None
+    if use_yt:
+        ytdlp = find_exe([ytdlp_path, "yt-dlp", r"E:\yt-dlp.exe", os.path.join(APP_DIR,"yt-dlp.exe")])
+        if not ytdlp:
+            log_cb("[~] yt-dlp not found, installing via pip...\n")
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install", "yt-dlp", "-q"], timeout=60)
+                ytdlp = find_exe(["yt-dlp"])
+                if ytdlp: log_cb("[✓] yt-dlp installed\n\n")
+            except: pass
 
-    if ytdlp:
+    if use_yt and ytdlp:
         # For DASH MPD: yt-dlp can take a direct MPD URL
         # format: best video at target height + best audio
-        fmt = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]" if height else "bestvideo+bestaudio/best"
+        # yt-dlp audio language filter — single lang only (yt-dlp can't mux multi-audio)
+        if audio_lang and audio_lang not in ("best", ""):
+            first_lang = audio_lang.split(",")[0].strip()
+            audio_fmt = f"bestaudio[language={first_lang}]/bestaudio"
+        else:
+            audio_fmt = "bestaudio"
+        fmt = (f"bestvideo[height<={height}]+{audio_fmt}/best[height<={height}]"
+               if height else f"bestvideo+{audio_fmt}/best")
         cmd = [
             ytdlp, stream_url,
             "-f", fmt,
@@ -410,7 +508,7 @@ def run_download(stream_url, out_dir, out_name, quality, cfg, progress_cb, log_c
             "-o", out_mp4,
             "--add-header", "Referer: https://www.hotstar.com/",
             "--add-header", "Origin: https://www.hotstar.com",
-            "--merge-output-format", "mp4",
+            "--merge-output-format", "mkv",
             "--no-warnings",
             "--newline",
         ]
@@ -425,9 +523,13 @@ def run_download(stream_url, out_dir, out_name, quality, cfg, progress_cb, log_c
         rc = run_proc(cmd, parse_yt)
         if rc == 0:   progress_cb(100,""); return True, out_mp4
         if rc == -99: return False, None
+        if engine == "ytdlp":
+            log_cb("[✗] yt-dlp failed. Check the log above.\n")
+            return False, None
         log_cb("[!] yt-dlp failed, falling back to ffmpeg\n\n")
 
     # ── 3. ffmpeg (sequential fallback) ──
+    use_ff = engine in ("auto", "ffmpeg")
     ff = find_exe([ff_path, "ffmpeg", r"E:\ffmpeg.exe", r"E:\ffmpeg\bin\ffmpeg.exe"])
     if not ff:
         log_cb("[✗] No downloader found.\n    Install yt-dlp: pip install yt-dlp\n    Or ffmpeg from ffmpeg.org\n")
@@ -439,7 +541,7 @@ def run_download(stream_url, out_dir, out_name, quality, cfg, progress_cb, log_c
            "-i", stream_url]
     if mpd_idx is not None:
         cmd += ["-map", f"0:v:{mpd_idx}", "-map", "0:a:0"]
-    cmd += ["-c","copy","-movflags","+faststart", out_mp4, "-y",
+    cmd += ["-c","copy", out_mp4, "-y",
             "-progress","pipe:1","-nostats","-loglevel","error"]
     log_cb(f"[ffmpeg] sequential fallback | {height}p stream #{mpd_idx}\n\n")
 
@@ -662,7 +764,7 @@ class App(tk.Tk):
         tk.Frame(foot, bg=FG3, height=1).pack(fill="x")
         tk.Label(foot, text="Made by Rvind", bg=BG2, fg=FG3,
                  font=("Segoe UI",8)).pack(side="right", padx=14, pady=5)
-        tk.Label(foot, text="v4  •  plain DASH  •  no DRM  •  yt-dlp/N_m3u8DL-RE/ffmpeg",
+        tk.Label(foot, text="v6  •  plain DASH  •  yt-dlp/N_m3u8DL-RE/ffmpeg",
                  bg=BG2, fg=FG3, font=("Segoe UI",8)).pack(side="left", padx=14, pady=5)
 
     # ───────────────────── LOGIN TAB ─────────────────────
@@ -802,18 +904,61 @@ class App(tk.Tk):
         outer = tk.Frame(f, bg=BG); outer.pack(fill="both",expand=True)
         card = tk.Frame(outer, bg=BG2, padx=26, pady=24); card.pack(fill="x",padx=26,pady=22)
         tk.Label(card, text="Settings", bg=BG2, fg=ACC,
-                 font=("Segoe UI",13,"bold")).grid(row=0,column=0,columnspan=4,sticky="w",pady=(0,22))
+                 font=("Segoe UI",13,"bold")).grid(row=0,column=0,columnspan=4,sticky="w",pady=(0,10))
         self._cfg_vars = {}
+
+        # ── Download Engine selector ──────────────────────────────
+        tk.Label(card, text="╌╌  Download Engine  ╌╌", bg=BG2, fg=FG3,
+                 font=("Segoe UI",8)).grid(row=1,column=0,columnspan=4,sticky="w",pady=(0,6))
+
+        eng_frame = tk.Frame(card, bg=BG2); eng_frame.grid(row=2,column=0,columnspan=4,sticky="w",pady=(0,12))
+        self._engine_var = tk.StringVar(value=self.cfg.get("engine","auto"))
+
+        engines = [
+            ("auto",      "🔄  Auto",           "Try N_m3u8DL-RE → yt-dlp → ffmpeg in order"),
+            ("n_m3u8dl",  "⚡  N_m3u8DL-RE",    "Fastest · parallel streams · multi-audio MKV · recommended"),
+            ("ytdlp",     "📦  yt-dlp",          "Good fallback · single audio track only"),
+            ("ffmpeg",    "🔧  ffmpeg",           "Slow but always works · sequential download"),
+        ]
+        for col,(val,lbl,tip) in enumerate(engines):
+            cell = tk.Frame(eng_frame, bg=BG3, padx=10, pady=8, cursor="hand2")
+            cell.grid(row=0, column=col, padx=(0,8), sticky="n")
+            rb = tk.Radiobutton(cell, text=lbl, variable=self._engine_var, value=val,
+                                bg=BG3, fg=FG, selectcolor=BG3, activebackground=BG3,
+                                activeforeground=ACC, font=("Segoe UI",9,"bold"),
+                                indicatoron=True, bd=0, highlightthickness=0)
+            rb.pack(anchor="w")
+            tk.Label(cell, text=tip, bg=BG3, fg=FG2,
+                     font=("Segoe UI",7), wraplength=130, justify="left").pack(anchor="w",pady=(4,0))
+            cell.bind("<Button-1>", lambda e,v=val: self._engine_var.set(v))
+
+        # highlight selected cell
+        def _refresh_eng_ui(*_):
+            selected = self._engine_var.get()
+            for col,(val,_,__) in enumerate(engines):
+                w = eng_frame.grid_slaves(row=0,column=col)
+                if w:
+                    w[0].configure(bg=ACC if val==selected else BG3)
+                    for child in w[0].winfo_children():
+                        child.configure(bg=ACC if val==selected else BG3)
+        self._engine_var.trace_add("write", _refresh_eng_ui)
+        _refresh_eng_ui()
+
+        # ── Paths ─────────────────────────────────────────────────
+        tk.Label(card, text="╌╌  Paths  ╌╌", bg=BG2, fg=FG3,
+                 font=("Segoe UI",8)).grid(row=3,column=0,columnspan=4,sticky="w",pady=(4,6))
+
         rows = [
-            ("token_file",    "Token File",    "Path to save/load your login token"),
-            ("output_dir",    "Output Folder", "Default download destination"),
-            ("n_m3u8dl_path", "N_m3u8DL-RE",  "Fastest (aria2c parallel). github.com/nilaoda/N_m3u8DL-RE"),
-            ("ffmpeg_path",   "ffmpeg",         "Last-resort fallback. 'ffmpeg' if in PATH"),
+            ("token_file",    "Token File",     "Path to save/load your login token"),
+            ("output_dir",    "Output Folder",  "Default download destination"),
+            ("n_m3u8dl_path", "N_m3u8DL-RE exe","⚡ Fastest engine. Download from github.com/nilaoda/N_m3u8DL-RE"),
+            ("ytdlp_path",    "yt-dlp exe",     "📦 Fallback engine. pip install yt-dlp  OR  path to yt-dlp.exe"),
+            ("ffmpeg_path",   "ffmpeg exe",     "🔧 Required for muxing. 'ffmpeg' if in PATH"),
         ]
         for i,(k,lbl,hint) in enumerate(rows):
-            r = i+1
+            r = i+4
             tk.Label(card, text=lbl, bg=BG2, fg=FG, font=FONTB,
-                     width=16, anchor="w").grid(row=r,column=0,sticky="w",pady=8)
+                     width=16, anchor="w").grid(row=r,column=0,sticky="w",pady=7)
             var = tk.StringVar(value=self.cfg.get(k,""))
             self._cfg_vars[k] = var
             tk.Entry(card, textvariable=var, bg=BG3, fg=FG, insertbackground=ACC3,
@@ -825,7 +970,7 @@ class App(tk.Tk):
             tk.Label(card, text=hint, bg=BG2, fg=FG2, font=("Segoe UI",8),
                      wraplength=180).grid(row=r,column=3,padx=8,sticky="w")
 
-        r = len(rows)+1
+        r = len(rows)+4
         tk.Frame(card, bg=BG3, height=1).grid(row=r,column=0,columnspan=4,sticky="ew",pady=14)
         r += 1
         tk.Label(card, text="DL Threads", bg=BG2, fg=FG, font=FONTB,
@@ -838,13 +983,13 @@ class App(tk.Tk):
         self._threads_lbl = tk.Label(tr, text=str(self.cfg.get("threads",16)),
                                       bg=BG2, fg=ACC3, font=("Consolas",10,"bold"), width=3)
         self._threads_lbl.pack(side="left",padx=8)
-        tk.Label(card, text="yt-dlp concurrent fragments / N_m3u8DL-RE threads", bg=BG2, fg=FG2,
+        tk.Label(card, text="Parallel threads / concurrent fragments per download", bg=BG2, fg=FG2,
                  font=("Segoe UI",8)).grid(row=r,column=3,sticky="w",padx=8)
         r += 1
         tk.Label(card, text="Subtitles", bg=BG2, fg=FG, font=FONTB,
                  anchor="w").grid(row=r,column=0,sticky="w",pady=8)
         self._subs_var = tk.BooleanVar(value=self.cfg.get("grab_subs",False))
-        ttk.Checkbutton(card, text="Download subtitle tracks (N_m3u8DL-RE only)",
+        ttk.Checkbutton(card, text="Always grab subtitle tracks (N_m3u8DL-RE only)",
                         variable=self._subs_var).grid(row=r,column=1,columnspan=3,sticky="w")
         r += 1
         tk.Frame(card, bg=BG3, height=1).grid(row=r,column=0,columnspan=4,sticky="ew",pady=14)
@@ -977,18 +1122,85 @@ class App(tk.Tk):
             if status != 200:
                 self.after(0, lambda: self._show_err(f"API error {status}")); return
             self._mpd, self._m3u8 = mpd, m3u8
-            quals, dur = parse_qualities(mpd) if mpd else ([], None)
+            quals, dur, audio_tracks, sub_tracks = parse_qualities(mpd) if mpd else ([], None, [], [])
             self._quals, self._duration = quals, dur
-            self.after(0, lambda: self._show_quals(quals))
+            self._audio_tracks, self._sub_tracks = audio_tracks, sub_tracks
+            self.after(0, lambda: self._show_quals(quals, audio_tracks, sub_tracks))
         threading.Thread(target=_w, daemon=True).start()
 
     def _show_err(self, msg):
         for w in self._q_frame.winfo_children(): w.destroy()
         tk.Label(self._q_frame, text=f"✗ {msg}", bg=BG2, fg=RED, font=("Segoe UI",9)).pack(anchor="w")
 
-    def _show_quals(self, quals):
+    def _make_mini_cb(self, parent, var, label, color=None):
+        """Tiny canvas checkbox + label, returns the frame."""
+        fg = color or FG
+        f = tk.Frame(parent, bg=BG2, cursor="hand2")
+        cv = tk.Canvas(f, width=14, height=14, bg=BG2, highlightthickness=0)
+        cv.pack(side="left", padx=(0, 3))
+        lbl = tk.Label(f, text=label, bg=BG2, fg=fg, font=("Segoe UI", 8))
+        lbl.pack(side="left")
+        def _draw(*_):
+            cv.delete("all")
+            on = var.get()
+            cv.create_rectangle(1, 1, 13, 13, fill=ACC if on else BG3,
+                                 outline=ACC if on else FG3, width=1)
+            if on:
+                cv.create_line(2, 7, 5, 11, fill="#fff", width=1, capstyle="round")
+                cv.create_line(5, 11, 12, 3, fill="#fff", width=1, capstyle="round")
+        _draw()
+        var.trace_add("write", _draw)
+        def _toggle(e=None): var.set(not var.get())
+        cv.bind("<Button-1>", _toggle); lbl.bind("<Button-1>", _toggle); f.bind("<Button-1>", _toggle)
+        return f
+
+    def _show_quals(self, quals, audio_tracks=None, sub_tracks=None):
         for w in self._q_frame.winfo_children(): w.destroy()
         self._q_vars = []
+
+        # ── audio language checkboxes (default ALL checked) ──
+        audio_tracks = audio_tracks or []
+        sub_tracks   = sub_tracks or []
+        self._audio_cb_vars = {}   # code -> BooleanVar
+        self._sub_cb_vars   = {}   # code -> BooleanVar
+
+        if audio_tracks:
+            ar = tk.Frame(self._q_frame, bg=BG2); ar.pack(fill="x", pady=(0, 4))
+            tk.Label(ar, text="🔊 Audio:", bg=BG2, fg=FG2,
+                     font=("Segoe UI", 8, "bold"), width=8, anchor="w").pack(side="left")
+            for i, t in enumerate(audio_tracks):
+                v = tk.BooleanVar(value=(i == 0))   # only first track checked by default
+                self._audio_cb_vars[t["code"]] = v
+                self._make_mini_cb(ar, v, t["label"]).pack(side="left", padx=(0, 8))
+            # "ALL" toggle shortcut
+            def _toggle_all_audio():
+                new = not all(v.get() for v in self._audio_cb_vars.values())
+                for v in self._audio_cb_vars.values(): v.set(new)
+            btn = tk.Label(ar, text="[all]", bg=BG2, fg=ACC, font=("Segoe UI", 7),
+                           cursor="hand2")
+            btn.pack(side="left", padx=(4, 0))
+            btn.bind("<Button-1>", lambda e: _toggle_all_audio())
+
+        # ── subtitle checkboxes (default ALL checked) ──
+        if sub_tracks:
+            sr = tk.Frame(self._q_frame, bg=BG2); sr.pack(fill="x", pady=(0, 6))
+            tk.Label(sr, text="💬 Subs:", bg=BG2, fg=FG2,
+                     font=("Segoe UI", 8, "bold"), width=8, anchor="w").pack(side="left")
+            for t in sub_tracks:
+                v = tk.BooleanVar(value=False)   # subs off by default
+                self._sub_cb_vars[t["code"]] = v
+                self._make_mini_cb(sr, v, t["label"]).pack(side="left", padx=(0, 8))
+            def _toggle_all_subs():
+                new = not all(v.get() for v in self._sub_cb_vars.values())
+                for v in self._sub_cb_vars.values(): v.set(new)
+            btn2 = tk.Label(sr, text="[all]", bg=BG2, fg=ACC, font=("Segoe UI", 7),
+                            cursor="hand2")
+            btn2.pack(side="left", padx=(4, 0))
+            btn2.bind("<Button-1>", lambda e: _toggle_all_subs())
+
+        if audio_tracks or sub_tracks:
+            tk.Frame(self._q_frame, bg=BG3, height=1).pack(fill="x", pady=(4, 6))
+
         if quals:
             # header
             hdr = tk.Frame(self._q_frame, bg=BG2); hdr.pack(fill="x")
@@ -1045,9 +1257,30 @@ class App(tk.Tk):
         out_dir = self._out_var.get().strip() or self.cfg.get("output_dir", APP_DIR)
         self.cfg["output_dir"] = out_dir
         cfg_snap = dict(self.cfg)
-        cfg_snap["threads"]   = int(self._threads_var.get())
-        cfg_snap["grab_subs"] = self._subs_var.get()
-        cfg_snap["_duration"] = self._duration
+        cfg_snap["threads"]    = int(self._threads_var.get())
+        cfg_snap["grab_subs"]  = self._subs_var.get()
+        cfg_snap["engine"]     = self._engine_var.get()
+        cfg_snap["_duration"]  = self._duration
+        # collect checked audio languages — always pass explicit codes, never "ALL"
+        audio_cb = getattr(self, "_audio_cb_vars", {})
+        checked_audio = [code for code, v in audio_cb.items() if v.get()]
+        if checked_audio:
+            cfg_snap["audio_lang"] = ",".join(checked_audio)   # e.g. "hi,te,ta" or "te"
+        else:
+            cfg_snap["audio_lang"] = "best"
+        # pass per-lang max bitrates so downloader can filter dynamically
+        all_tracks = getattr(self, "_audio_tracks", [])
+        cfg_snap["_audio_max_kbps"] = {t["code"]: t.get("max_kbps", 128) for t in all_tracks}
+
+        # collect checked subtitle languages
+        sub_cb = getattr(self, "_sub_cb_vars", {})
+        checked_subs = [code for code, v in sub_cb.items() if v.get()]
+        if not sub_cb or not checked_subs:
+            cfg_snap["sub_lang"] = "NONE"
+        elif len(checked_subs) == len(sub_cb):
+            cfg_snap["sub_lang"] = "ALL"
+        else:
+            cfg_snap["sub_lang"] = ",".join(checked_subs)
 
         self._cancel.clear()
         self._dl_btn.configure(state="disabled", text="Downloading...")
@@ -1124,6 +1357,7 @@ class App(tk.Tk):
         for k,v in self._cfg_vars.items(): self.cfg[k] = v.get()
         self.cfg["threads"]   = int(self._threads_var.get())
         self.cfg["grab_subs"] = self._subs_var.get()
+        self.cfg["engine"]    = self._engine_var.get()
         self._out_var.set(self.cfg.get("output_dir",""))
         save_cfg(self.cfg)
         self._cfg_msg.configure(text="✓ Saved")
