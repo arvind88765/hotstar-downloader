@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """
-JioHotstar Downloader GUI  v4
 pip install requests
 python hotstar_gui.py
 """
