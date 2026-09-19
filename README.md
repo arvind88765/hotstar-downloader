@@ -28,9 +28,9 @@ download jiohotstar episodes with a clean GUI. no DRM, no Widevine, no sketchy k
 
 <!-- drop your video link below once you upload it -->
 
-https://github.com/user-attachments/assets/YOUR-VIDEO-ID-HERE
 
-> upload your demo `.mp4` to this repo (drag into any issue or PR) and GitHub gives you an `assets/...` URL, paste it above and delete this line
+https://github.com/user-attachments/assets/25178f99-6a74-41a1-ad13-865cdaf81ea7
+
 
 ---
 
